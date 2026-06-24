@@ -11,7 +11,7 @@
             <p class="tw-hint">Importez un fichier <strong>GPX</strong> ou <strong>KML</strong> pour afficher votre tracé sur la carte.</p>
             <label class="tw-file-label">
                 📂 Choisir un fichier GPX / KML
-                <input type="file" accept=".gpx,.kml" on:change={handleFileImport} class="tw-file-input" />
+                <input type="file" accept=".gpx,.kml,application/gpx+xml,application/vnd.google-earth.kml+xml,text/xml,*/*" on:change={handleFileImport} class="tw-file-input" />
             </label>
             {#if errorMsg}<p class="tw-error">{errorMsg}</p>{/if}
         </div>
@@ -206,13 +206,23 @@
     function parseKML(text: string) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(text, 'application/xml');
-        const coordsEl = doc.querySelector('coordinates');
-        if (!coordsEl) { errorMsg = 'Aucune coordonnée trouvée dans ce fichier KML.'; return; }
-        const raw = coordsEl.textContent?.trim() || '';
+
+        // Collect all <coordinates> elements (LineString, Polygon, Point, Track...)
+        const coordsEls = doc.querySelectorAll('coordinates');
+        if (!coordsEls.length) { errorMsg = 'Aucune coordonnée trouvée dans ce fichier KML.'; return; }
+
         const pts: LatLon[] = [];
         const elevs: number[] = [];
-        raw.split(/\s+/).forEach(tuple => {
-            const parts = tuple.split(',');
+
+        // Pick the element with the most tuples (= the track, not isolated points)
+        let bestRaw = '';
+        coordsEls.forEach(el => {
+            const raw = el.textContent?.trim() || '';
+            if (raw.length > bestRaw.length) bestRaw = raw;
+        });
+
+        bestRaw.split(/\s+/).forEach(tuple => {
+            const parts = tuple.trim().split(',');
             if (parts.length >= 2) {
                 const lon = parseFloat(parts[0]);
                 const lat = parseFloat(parts[1]);
@@ -220,6 +230,8 @@
                 if (!isNaN(lat) && !isNaN(lon)) { pts.push({ lat, lon }); elevs.push(ele); }
             }
         });
+
+        if (!pts.length) { errorMsg = 'Aucun point valide trouvé dans ce fichier KML.'; return; }
         loadRoute(pts, elevs);
     }
 
