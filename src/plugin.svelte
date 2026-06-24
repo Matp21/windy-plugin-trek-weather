@@ -57,31 +57,36 @@
                     </div>
                     {#if seg.date}
                         <div class="tw-day-date-row">
-                            <span class="tw-date-label">📆</span>
-                            <input type="date" bind:value={seg.date} class="tw-date-input" on:change={() => updateDates(i)} />
+                            <span class="tw-date-label">📆 {formatDate(seg.date)}</span>
                         </div>
                     {/if}
                     <!-- Weather panel shown when this day is active -->
                     {#if activeDayIndex === i}
                         <div class="tw-weather-panel">
-                            <div class="tw-weather-mid">
-                                <span class="tw-weather-label">📍 Point météo :</span>
-                                <span class="tw-weather-coords">{formatLatLon(midPoint(seg))}</span>
-                            </div>
-                            <div class="tw-weather-actions">
-                                <button class="tw-btn tw-btn-sm tw-btn-weather" on:click={() => openWindyDetail(seg)}>
-                                    📊 Ouvrir prévisions détaillées
-                                </button>
-                                <button class="tw-btn tw-btn-sm tw-btn-secondary" on:click={clearActiveDay}>← Désélectionner</button>
-                            </div>
                             {#if seg.date}
                                 <div class="tw-weather-ts">
-                                    <span>🕐 Timeline → {formatDate(seg.date)}</span>
-                                    <button class="tw-btn tw-btn-sm tw-btn-primary" on:click={() => setTimestamp(seg.date)}>
-                                        Aller à cette date
-                                    </button>
+                                    <span>🕐 {formatDate(seg.date)}</span>
+                                    <button class="tw-btn tw-btn-sm tw-btn-primary" on:click={() => setTimestamp(seg.date)}>→ Timeline</button>
                                 </div>
                             {/if}
+                            <button class="tw-btn tw-btn-sm tw-btn-weather tw-btn-fetch" on:click={() => fetchWeather(i)} disabled={weatherLoading}>
+                                {weatherLoading ? '⏳ Chargement…' : '🌡 Météo au point milieu'}
+                            </button>
+                            {#if weatherData}
+                                <div class="tw-weather-grid">
+                                    {#each weatherData as w}
+                                        <div class="tw-weather-item">
+                                            <span class="tw-weather-icon">{w.icon}</span>
+                                            <span class="tw-weather-val">{w.value}</span>
+                                            <span class="tw-weather-lbl">{w.label}</span>
+                                        </div>
+                                    {/each}
+                                </div>
+                            {/if}
+                            {#if weatherError}
+                                <p class="tw-weather-err">{weatherError}</p>
+                            {/if}
+                            <button class="tw-btn tw-btn-sm tw-btn-secondary" on:click={clearActiveDay}>← Retour</button>
                         </div>
                     {/if}
                 </div>
@@ -95,7 +100,17 @@
         <!-- ── Start date ── -->
         <div class="tw-section">
             <div class="tw-section-title">📆 Date de départ</div>
-            <input type="date" bind:value={startDate} on:change={rebuildDates} class="tw-date-input tw-date-full" />
+            <div class="tw-date-selects">
+                <select bind:value={startDay} on:change={onStartDateChange} class="tw-select">
+                    {#each days as d}<option value={d}>{d}</option>{/each}
+                </select>
+                <select bind:value={startMonth} on:change={onStartDateChange} class="tw-select">
+                    {#each months as m, i}<option value={i+1}>{m}</option>{/each}
+                </select>
+                <select bind:value={startYear} on:change={onStartDateChange} class="tw-select">
+                    {#each years as y}<option value={y}>{y}</option>{/each}
+                </select>
+            </div>
         </div>
 
         <!-- ── Legend ── -->
@@ -112,6 +127,8 @@
     import bcast from '@windy/broadcast';
     import { map } from '@windy/map';
     import store from '@windy/store';
+    import { getLatLonInterpolator } from '@windy/interpolator';
+    import metrics from '@windy/metrics';
     import config from './pluginConfig';
 
     interface LatLon { lat: number; lon: number }
@@ -146,14 +163,82 @@
     let activeDayIndex: number | null = null;
     let placingWaypoint = false;
     let startDate = '';
+    // Date selects (Android-compatible)
+    const now = new Date();
+    let startDay = now.getDate();
+    let startMonth = now.getMonth() + 1;
+    let startYear = now.getFullYear();
+    const days = Array.from({length: 31}, (_, i) => i + 1);
+    const months = ['Jan','Fév','Mar','Avr','Mai','Juin','Juil','Aoû','Sep','Oct','Nov','Déc'];
+    const years = Array.from({length: 3}, (_, i) => now.getFullYear() + i);
+
+    function onStartDateChange() {
+        const mm = String(startMonth).padStart(2, '0');
+        const dd = String(startDay).padStart(2, '0');
+        startDate = `${startYear}-${mm}-${dd}`;
+        rebuildDates();
+    }
     let errorMsg = '';
     let currentOverlay = 'wind';
+    // Weather interpolation state
+    let weatherData: {icon: string; value: string; label: string}[] | null = null;
+    let weatherLoading = false;
+    let weatherError = '';
 
     // ── Leaflet layers ───────────────────────────────────────────────────────
     let fullRouteLayer: L.Polyline | null = null;
     let segmentLayers: L.Polyline[] = [];
     let waypointMarkers: L.Marker[] = [];
     const COLORS = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16'];
+
+    // ── Weather interpolation ────────────────────────────────────────────────
+    async function fetchWeather(dayIdx: number) {
+        const seg = daySegments[dayIdx];
+        const mid = midPoint(seg);
+        weatherData = null;
+        weatherError = '';
+        weatherLoading = true;
+
+        // Set timestamp to the day at noon if date is set
+        if (seg.date) setTimestamp(seg.date);
+
+        try {
+            const interpolate = await getLatLonInterpolator();
+            if (!interpolate) { weatherError = 'Données non disponibles pour cette couche.'; weatherLoading = false; return; }
+
+            const overlay = store.get('overlay') as string || 'wind';
+            const results: {icon: string; value: string; label: string}[] = [];
+
+            // Helper to get value for a specific overlay
+            async function getVal(ovKey: string, icon: string, label: string, metricKey: string) {
+                try {
+                    store.set('overlay', ovKey);
+                    await new Promise(r => setTimeout(r, 400));
+                    const interp2 = await getLatLonInterpolator();
+                    if (!interp2) return;
+                    const val = await interp2({ lat: mid.lat, lon: mid.lon });
+                    if (Array.isArray(val) && val[0] !== null && !isNaN(val[0])) {
+                        const m = (metrics as any)[metricKey];
+                        const str = m ? m.convertValue(val[0]) : val[0].toFixed(1);
+                        results.push({ icon, label, value: str });
+                    }
+                } catch(e) {}
+            }
+
+            await getVal('wind',   '💨', 'Vent',       'wind');
+            await getVal('temp',   '🌡', 'Temp.',      'temp');
+            await getVal('rain',   '🌧', 'Pluie',      'rain');
+            await getVal('clouds', '☁️', 'Nuages',     'clouds');
+
+            // Restore original overlay
+            store.set('overlay', overlay);
+            weatherData = results.length ? results : null;
+            if (!results.length) weatherError = 'Aucune donnée disponible à ce point.';
+        } catch(e) {
+            weatherError = 'Erreur lors de la récupération des données.';
+        }
+        weatherLoading = false;
+    }
 
     // ── Overlay control ──────────────────────────────────────────────────────
     function setOverlay(key: string) {
@@ -378,6 +463,7 @@
 
     // ── Focus day + météo ────────────────────────────────────────────────────
     function focusDaySegment(i: number) {
+        weatherData = null; weatherError = '';
         activeDayIndex = activeDayIndex === i ? null : i;
         redrawSegments();
         if (activeDayIndex === null) { fitMapToRoute(); return; }
@@ -475,6 +561,12 @@
             routeElevations = state.routeElevations || routePoints.map(() => 0);
             waypoints = state.waypoints || [];
             startDate = state.startDate || '';
+            if (startDate) {
+                const parts = startDate.split('-');
+                startYear = parseInt(parts[0]);
+                startMonth = parseInt(parts[1]);
+                startDay = parseInt(parts[2]);
+            }
             routeDistanceKm = totalDistance(routePoints).toFixed(1);
             routeLoaded = true;
             activeDayIndex = null; errorMsg = '';
@@ -562,6 +654,18 @@
 
     /* Legend */
     .tw-legend { display: flex; flex-wrap: wrap; gap: 0.3rem 0.7rem; padding: 0.5rem 0.8rem; font-size: 0.67rem; color: #64748b; }
+
+    /* Weather inline */
+    .tw-weather-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.35rem; margin: 0.3rem 0; }
+    .tw-weather-item { background: #0f172a; border-radius: 6px; padding: 0.4rem 0.5rem; display: flex; align-items: center; gap: 0.4rem; }
+    .tw-weather-icon { font-size: 1.1rem; }
+    .tw-weather-val { font-size: 0.9rem; font-weight: 700; color: #e2e8f0; }
+    .tw-weather-lbl { font-size: 0.65rem; color: #64748b; margin-left: auto; }
+    .tw-weather-err { font-size: 0.75rem; color: #f87171; margin: 0.3rem 0; }
+    .tw-btn-fetch { width: 100%; margin-bottom: 0.3rem; }
+
+    .tw-date-selects { display: flex; gap: 0.4rem; }
+    .tw-select { flex: 1; background: #0f172a; border: 1px solid #334155; color: #e2e8f0; border-radius: 4px; padding: 0.3rem 0.2rem; font-size: 0.78rem; }
 
     :global(.tw-marker) { width: 28px; height: 28px; border-radius: 50%; border: 2px solid white; color: white; font-weight: 700; font-size: 12px; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 6px rgba(0,0,0,0.5); }
 </style>
